@@ -1,10 +1,9 @@
-from flask import Flask, render_template, request, send_file, send_from_directory
+from flask import Flask, render_template, request, send_file
 from docx import Document
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 import os
 import uuid
-import io
 
 app = Flask(__name__)
 
@@ -123,6 +122,10 @@ def create_document(content, topic, image_path, has_illustration):
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     document.save(filepath)
     return filepath
+
+# This is the handler for Vercel
+def vercel_handler(request):
+    return app(request.environ, lambda status, headers: None)
 
 if __name__ == '__main__':
     app.run(debug=True)

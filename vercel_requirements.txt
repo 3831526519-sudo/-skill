@@ -1,0 +1,4 @@
+flask
+python-docx
+# Note: docx2pdf may not work properly in Vercel's Linux environment
+# Consider alternative approaches for PDF generation in serverless environments
