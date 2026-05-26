@@ -1,10 +1,14 @@
-from flask import Flask, render_template, request, send_file, send_from_directory
+from flask import Flask, render_template, request, send_file
 from docx import Document
 from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 import os
 import uuid
-import io
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 app = Flask(__name__)
 
@@ -14,6 +18,12 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB limit
 
 # Ensure upload directory exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# Initialize DeepSeek client
+client = OpenAI(
+    api_key=os.getenv("DEEPSEEK_API_KEY"),
+    base_url="https://api.deepseek.com"
+)
 
 @app.route('/')
 def index():
@@ -36,38 +46,117 @@ def generate():
                 filename = str(uuid.uuid4()) + os.path.splitext(file.filename)[1]
                 image_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
                 file.save(image_path)
-        else:
-            # Generate a placeholder image path (in reality, we might generate an image)
-            # For simplicity, we'll use a placeholder or skip
-            image_path = None  # We'll handle missing image in document generation
     
-    # Generate essay content (simplified)
-    essay_content = generate_essay(topic, word_count, structure)
+    # Use DeepSeek AI to generate essay content (with fallback)
+    essay_content = generate_essay_with_deepseek(topic, word_count, structure, has_illustration)
     
     # Create Word document
     doc_path = create_document(essay_content, topic, image_path, has_illustration)
     
-    # Return Word document for download (PDF conversion removed for Vercel compatibility)
+    # Return Word document for download
     return send_file(doc_path, as_attachment=True, download_name=f'{topic}_课程论文.docx')
 
-def generate_essay(topic, word_count, structure):
-    # This is a placeholder for actual AI generation
-    # We'll generate a simple essay based on the structure
+def generate_essay_with_deepseek(topic, word_count, structure, has_illustration=False):
+    """
+    使用DeepSeek API生成论文内容
+    """
+    # 构建系统提示词和用户提示词
+    system_prompt = """你是一位经验丰富的大学导师，擅长指导文科本科生完成课程论文写作。
+    你的任务是根据用户提供的主题、字数要求和结构偏好，生成一篇符合学术规范的课程论文。
+    生成的内容应当：
+    1. 语言正式、学术，但不过于晦涩
+    2. 结构清晰，逻辑连贯
+    3. 观点有依据，避免无根据的断言
+    4. 符合"够交差型"标准 - 重点在完成度和规范性而非创新性
+    5. 不要使用第一人称，保持客观中立的学术语气
+    6. 字数要接近用户指定的目标范围（±10%可接受）"""
+    
+    # 根据结构类型构建不同的提示
+    structure_desc = "三部分结构：引言（述背景提出问题）- 论点一（理论分析）- 论点二（现实案例）- 结论（综合总结提出建议）" \
+                    if structure == 'three-part' else \
+                    "自由结构：可包括引言、理论综述、问题分析、案例研究、结论等部分，逻辑自然连贯"
+    
+    illustration_note = "建议在适当位置留出1-2个插入图片的空白，图片应与论证内容相关。" \
+                       if has_illustration else "纯文本论文，无需考虑插图位置。"
+    
+    user_prompt = f"""请为以下课程论文要求生成内容：
+
+论文主题：{topic}
+目标字数：{word_count}字左右
+论文结构：{structure_desc}
+其他要求：{illustration_note}
+
+请直接返回论文正文内容，不要包含任何说明性文字、标题或格式标记。
+内容应从论文正文开始（不需要重复标题），可以自然包含段落划分。"""
+
+    try:
+        # 调用DeepSeek API
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.7,  # 平衡创造性和一致性
+            max_tokens=min(word_count * 2, 2000),  # 粗略估算：中文约1字=0.5token
+            stream=False
+        )
+        
+        # 提取生成的内容
+        generated_text = response.choices[0].message.content.strip()
+        
+        # 后处理：确保基本质量
+        return post_process_essay(generated_text, topic, word_count)
+        
+    except Exception as e:
+        # 记录错误（在实际应用中应使用日志系统）
+        print(f"DeepSeek API调用失败: {str(e)}")
+        # 降级到原有模板生成方式
+        return generate_essay_fallback(topic, word_count, structure)
+
+def post_process_essay(text, topic, target_word_count):
+    """后处理AI生成的论文，确保基本质量"""
+    # 确保内容不为空
+    if not text or len(text.strip()) < 50:
+        return generate_essay_fallback(topic, target_word_count, 'three-part')
+    
+    # 简单的字数调整：如果太短则补充结论部分
+    current_words = len(text)
+    if current_words < target_word_count * 0.8:
+        conclusion = f"\n\n总之，{topic}是一个重要的研究课题。通过本文的分析可以看出，它具有重要的理论价值和现实意义。未来的研究可以进一步深化探讨其在不同背景下的应用。"
+        text += conclusion
+    # 如果太长则截取前半部分（简单处理）
+    elif current_words > target_word_count * 1.2:
+        # 按句子截断，尽量保持完整性
+        sentences = text.split('。')
+        target_sentences = max(3, int(len(sentences) * target_word_count / current_words))
+        text = '。'.join(sentences[:target_sentences]) + '。'
+    
+    # 确保有合理的开头结构
+    if not any(text.startswith(prefix) for prefix in ['引言', '第一章', '本文']):
+        text = f"引言：本文将围绕\"{topic}\"展开研究。\n\n" + text
+    
+    return text.strip()
+
+def generate_essay_fallback(topic, word_count, structure):
+    """原有的模板生成函数作为降级方案"""
     paragraphs = []
     if structure == 'three-part':
-        paragraphs.append("引言：本文将围绕\"{}\"展开讨论。".format(topic))
-        paragraphs.append("论点一：从历史角度看，{}具有重要意义。".format(topic))
-        paragraphs.append("论点二：从现实角度看，{}面临着新的挑战和机遇。".format(topic))
-        paragraphs.append("结论：综上所述，{}是一个值得深入研究的课题。".format(topic))
+        paragraphs.append(f"引言：本文将围绕\"{topic}\"展开讨论。")
+        paragraphs.append(f"论点一：从历史角度看，{topic}具有重要意义。")
+        paragraphs.append(f"论点二：从现实角度看，{topic}面临着新的挑战和机遇。")
+        paragraphs.append(f"结论：综上所述，{topic}是一个值得深入研究的课题。")
     else:  # free structure
-        paragraphs.append("随着社会的发展，{}问题日益突出。".format(topic))
+        paragraphs.append(f"随着社会的发展，{topic}问题日益突出。")
         paragraphs.append("学者们对此进行了广泛的研究。")
-        paragraphs.append("本文认为，需要从多个维度来理解{}。".format(topic))
-        paragraphs.append("总之，{}对社会发展有着重要影响。".format(topic))
+        paragraphs.append(f"本文认为，需要从多个维度来理解{topic}。")
+        paragraphs.append(f"总之，{topic}对社会发展有着重要影响。")
     
-    # Adjust to roughly meet word count (very rough approximation)
-    full_text = ' '.join(paragraphs)
-    # We'll just return the generated text; in reality, we'd adjust length
+    full_text = '。'.join(paragraphs) + '。'
+    # 简单调整以接近目标字数
+    if len(full_text) < word_count * 0.5:
+        full_text += f" 从理论与实践相结合的视角出发，对{topic}进行系统分析有助于深化我们的认识。"
+    
     return full_text
 
 def create_document(content, topic, image_path, has_illustration):
